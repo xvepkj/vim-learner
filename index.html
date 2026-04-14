@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vim Learner</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <div class="top-row">
+      <div class="logo">vim<span>learner</span></div>
+      <div class="top-right">
+        <div class="mode-toggle">
+          <button class="toggle-btn active" id="btn-challenges">challenges</button>
+          <button class="toggle-btn" id="btn-free">free</button>
+        </div>
+        <div class="nav" id="challenge-nav">
+          <button class="nav-btn" id="btn-prev">&larr;</button>
+          <span class="counter" id="counter"></span>
+          <button class="nav-btn" id="btn-next-nav">&rarr;</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="task" id="task-bar">
+      <p><strong id="task-title"></strong> <span id="task-desc"></span></p>
+      <div class="task-links">
+        <button class="link-btn" id="btn-hint">hint</button>
+        <button class="link-btn" id="btn-reset">reset</button>
+      </div>
+    </div>
+
+    <div class="free-reset hidden" id="free-reset-bar">
+      <button class="link-btn" id="btn-free-reset">reset</button>
+    </div>
+
+    <div class="hint hidden" id="hint-bar"></div>
+
+    <div class="editor-area" id="editor-area">
+      <div class="editor-panel">
+        <div class="editor-label">yours</div>
+        <div class="editor-wrap" id="editor-wrap" tabindex="0">
+          <div class="line-numbers" id="line-numbers"></div>
+          <div class="buffer" id="buffer"></div>
+        </div>
+        <div class="statusline">
+          <span class="mode" id="mode-indicator">NORMAL</span>
+          <span class="keys" id="keys-display"></span>
+          <span class="pos" id="cursor-info"></span>
+        </div>
+      </div>
+      <div class="editor-panel" id="target-panel">
+        <div class="editor-label target-label">target</div>
+        <div class="editor-wrap readonly">
+          <div class="line-numbers" id="target-line-numbers"></div>
+          <div class="buffer" id="target-buffer"></div>
+        </div>
+        <div class="statusline target-status">
+          <span class="match-status" id="match-status"></span>
+        </div>
+      </div>
+      <div class="cheat-sheet hidden" id="cheat-sheet">
+        <div class="cheat-section">
+          <div class="cheat-heading">Movement</div>
+          <div class="cheat-row"><kbd>h j k l</kbd> left / down / up / right</div>
+          <div class="cheat-row"><kbd>w b e</kbd> word forward / back / end</div>
+          <div class="cheat-row"><kbd>0 $</kbd> line start / end</div>
+          <div class="cheat-row"><kbd>gg G</kbd> file start / end</div>
+          <div class="cheat-row"><kbd>f{c} F{c}</kbd> find char forward / back</div>
+          <div class="cheat-row"><kbd>t{c} T{c}</kbd> till char forward / back</div>
+          <div class="cheat-row"><kbd>; ,</kbd> repeat find / reverse</div>
+          <div class="cheat-row"><kbd>{ }</kbd> paragraph up / down</div>
+          <div class="cheat-row"><kbd>%</kbd> matching bracket</div>
+        </div>
+        <div class="cheat-section">
+          <div class="cheat-heading">Editing</div>
+          <div class="cheat-row"><kbd>i a</kbd> insert before / after</div>
+          <div class="cheat-row"><kbd>I A</kbd> insert line start / end</div>
+          <div class="cheat-row"><kbd>o O</kbd> new line below / above</div>
+          <div class="cheat-row"><kbd>r{c}</kbd> replace char</div>
+          <div class="cheat-row"><kbd>x X</kbd> delete char / before</div>
+          <div class="cheat-row"><kbd>s S</kbd> substitute char / line</div>
+          <div class="cheat-row"><kbd>J</kbd> join lines</div>
+          <div class="cheat-row"><kbd>~</kbd> toggle case</div>
+          <div class="cheat-row"><kbd>u</kbd> undo &nbsp; <kbd>Ctrl-r</kbd> redo</div>
+          <div class="cheat-row"><kbd>.</kbd> repeat last change</div>
+        </div>
+        <div class="cheat-section">
+          <div class="cheat-heading">Operators</div>
+          <div class="cheat-row"><kbd>d</kbd> delete &nbsp; <kbd>c</kbd> change</div>
+          <div class="cheat-row"><kbd>y</kbd> yank &nbsp; <kbd>p P</kbd> paste</div>
+          <div class="cheat-row"><kbd>></kbd> indent &nbsp; <kbd><</kbd> dedent</div>
+          <div class="cheat-row"><kbd>dd yy cc</kbd> whole line</div>
+          <div class="cheat-row"><kbd>D C</kbd> to end of line</div>
+        </div>
+        <div class="cheat-section">
+          <div class="cheat-heading">Text Objects</div>
+          <div class="cheat-row"><kbd>iw aw</kbd> inner / a word</div>
+          <div class="cheat-row"><kbd>i" a"</kbd> inner / a quotes</div>
+          <div class="cheat-row"><kbd>i( i{ i[</kbd> inner parens / braces / brackets</div>
+          <div class="cheat-row"><kbd>it at</kbd> inner / a tag</div>
+          <div class="cheat-row"><kbd>ip ap</kbd> inner / a paragraph</div>
+        </div>
+        <div class="cheat-section">
+          <div class="cheat-heading">Visual</div>
+          <div class="cheat-row"><kbd>v</kbd> visual &nbsp; <kbd>V</kbd> visual line</div>
+          <div class="cheat-row">select then <kbd>d c y > <</kbd></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="success hidden" id="success-banner">
+      <span>Done!</span>
+      <button class="next-btn" id="btn-next">Next &rarr;</button>
+    </div>
+
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
