@@ -550,7 +550,35 @@ class VimEngine {
     return { startLine: this.cur.line, startCol: start, endLine: this.cur.line, endCol: end };
   }
 
+  _quoteObject(inner, q) {
+    // For same-char delimiters (quotes): find the pair on the current line
+    const line = this._line();
+    const col = this.cur.col;
+    const r = this.cur.line;
+    // Collect all positions of the quote char on this line
+    const positions = [];
+    for (let c = 0; c < line.length; c++) {
+      if (line[c] === q) positions.push(c);
+    }
+    // Find the pair that surrounds the cursor
+    for (let i = 0; i < positions.length - 1; i += 2) {
+      const openC = positions[i];
+      const closeC = positions[i + 1];
+      if (col >= openC && col <= closeC) {
+        if (inner) {
+          return { startLine: r, startCol: openC + 1, endLine: r, endCol: closeC - 1 };
+        }
+        return { startLine: r, startCol: openC, endLine: r, endCol: closeC };
+      }
+    }
+    return null;
+  }
+
   _pairObject(inner, open, close) {
+    // Handle same-character delimiters (quotes) separately
+    if (open === close) {
+      return this._quoteObject(inner, open);
+    }
     // Search outward for matching pair
     let depth = 0;
     let startR = -1, startC = -1;
