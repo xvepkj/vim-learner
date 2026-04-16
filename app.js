@@ -20,7 +20,13 @@ class VimEngine {
     this.lastChange = null;        // {keys, beforeState}
     this.recordingChange = [];
     this.searchPattern = "";
+    this.searchDirection = 1;       // 1=forward, -1=backward
+    this.searchBuffer = "";         // current search input
+    this.searchActive = false;      // true when typing in / or ? prompt
     this.statusMsg = "";
+    this.lastFind = null;          // {cmd, ch} for ; and , repeat
+    this._isRecordingChange = false;
+    this._changeKeys = [];
     this._snapshot();
   }
 
@@ -65,12 +71,58 @@ class VimEngine {
   // ── Process a single key event ──
   processKey(key) {
     this.statusMsg = "";
+    // Skip recording when replaying a change (null = disabled during replay)
+    const recording = this._isRecordingChange !== null;
+    const prevUndoLen = this.undoStack.length;
+    const prevMode = this.mode;
+
+    if (recording) {
+      // Track keys for `.` repeat — start fresh from normal mode
+      if (prevMode === "normal" && !this._isRecordingChange) {
+        if (key !== "." && key !== "u" && key !== "Ctrl-r") {
+          this._isRecordingChange = true;
+          this._changeKeys = [key];
+        }
+      } else if (this._isRecordingChange === true) {
+        this._changeKeys.push(key);
+      }
+    }
+
+    // ── Search prompt input ──
+    if (this.searchActive) {
+      this._searchInput(key);
+      return; // search mode handles its own clamp + doesn't affect change recording
+    }
+
     if (this.mode === "insert") {
       this._insertKey(key);
     } else if (this.mode === "normal" || this.mode === "visual" || this.mode === "visual-line") {
       this._normalKey(key);
     }
     this._clampCursor();
+
+    if (!recording) return;
+
+    // Finalize change recording
+    if (this._isRecordingChange === true) {
+      const pendingDone = this.pendingKeys.length === 0 && this.operator === null;
+      const backToNormal = this.mode === "normal" && pendingDone;
+      // Change is complete when we return to normal with no pending keys
+      if (backToNormal && prevMode === "insert") {
+        // Exited insert mode — save the full sequence including Escape
+        this.lastChange = this._changeKeys.slice();
+        this._isRecordingChange = false;
+        this._changeKeys = [];
+      } else if (backToNormal && prevMode !== "insert") {
+        // Normal-mode-only change (dd, x, dw, etc.) — save if undo was pushed
+        if (this.undoStack.length > prevUndoLen) {
+          this.lastChange = this._changeKeys.slice();
+        }
+        this._isRecordingChange = false;
+        this._changeKeys = [];
+      }
+      // Otherwise still recording (pending operator, or entered insert mode)
+    }
   }
 
   // ── Insert mode ──
@@ -133,6 +185,23 @@ class VimEngine {
       return;
     }
 
+    // ── Ctrl combos (must be checked early, before they get swallowed) ──
+    if (key === "Ctrl-r") { this._redo(); this._resetPending(); return; }
+    if (key === "Ctrl-d") {
+      const half = Math.max(1, Math.floor(15 / 2));
+      this.cur.line = Math.min(this.cur.line + half, this.lines.length - 1);
+      this._clampCursor();
+      this._resetPending();
+      return;
+    }
+    if (key === "Ctrl-u") {
+      const half = Math.max(1, Math.floor(15 / 2));
+      this.cur.line = Math.max(this.cur.line - half, 0);
+      this._clampCursor();
+      this._resetPending();
+      return;
+    }
+
     // ── Count prefix ──
     if (pending.length === 1 && /^[1-9]$/.test(key)) {
       this.count = (this.count || 0) * 10 + parseInt(key);
@@ -145,15 +214,14 @@ class VimEngine {
       return;
     }
 
-    // ── Operators waiting for motion ──
-    if (!this.operator && pending.length === 1 && "dcy><".includes(key)) {
-      // Check for doubled operator (dd, cc, yy, >>, <<)
+    // ── Operators waiting for motion (normal mode only, not visual) ──
+    if (this.mode === "normal" && !this.operator && pending.length === 1 && "dcy><".includes(key)) {
       this.operator = key;
       pending.length = 0;
       return;
     }
 
-    if (this.operator && pending.length === 1 && key === this.operator) {
+    if (this.mode === "normal" && this.operator && pending.length === 1 && key === this.operator) {
       // Doubled: dd, cc, yy, >>, <<
       this._pushUndo();
       const n = this._cnt();
@@ -166,13 +234,46 @@ class VimEngine {
       return;
     }
 
-    // ── Operator + motion ──
-    if (this.operator) {
+    // ── Operator + motion (normal mode only) ──
+    if (this.mode === "normal" && this.operator) {
       const motion = this._tryMotion(pending);
       if (motion === "partial") return; // need more keys
       if (motion) {
         this._pushUndo();
-        this._execOperatorMotion(this.operator, motion);
+        const lastKey = pending[pending.length - 1];
+        // Vim special case: cw and cW behave like ce and cE
+        if (this.operator === "c" && (lastKey === "w" || lastKey === "W")) {
+          const eMotion = lastKey === "w" ? this._endWordMotion() : this._endWORDMotion();
+          const n = this._cnt();
+          let finalDest = eMotion;
+          if (n > 1) {
+            const saved = { ...this.cur };
+            this._applyMotion(eMotion);
+            for (let i = 1; i < n; i++) {
+              const next = lastKey === "w" ? this._endWordMotion() : this._endWORDMotion();
+              if (next) this._applyMotion(next);
+            }
+            finalDest = { ...this.cur };
+            this.cur = saved;
+          }
+          this._execOperatorMotion(this.operator, finalDest);
+          this._resetPending();
+          return;
+        }
+        // Apply count: move cursor to final destination first
+        const n = this._cnt();
+        let finalDest = motion;
+        if (n > 1) {
+          const saved = { ...this.cur };
+          this._applyMotion(motion);
+          for (let i = 1; i < n; i++) {
+            const next = this._tryMotion(pending);
+            if (next && next !== "partial") this._applyMotion(next);
+          }
+          finalDest = { ...this.cur, exclusive: motion.exclusive };
+          this.cur = saved; // restore cursor before executing operator
+        }
+        this._execOperatorMotion(this.operator, finalDest);
         this._resetPending();
         return;
       }
@@ -277,15 +378,16 @@ class VimEngine {
         case "A": this._pushUndo(); this.mode = "insert"; this.cur.col = this._line().length; break;
         case "o": this._pushUndo(); this._openLine(false); break;
         case "O": this._pushUndo(); this._openLine(true); break;
-        case "s": this._pushUndo(); { const l = this._line(); this.lines[this.cur.line] = l.slice(0, this.cur.col) + l.slice(this.cur.col + 1); } this.mode = "insert"; break;
+        case "s": this._pushUndo(); { const n = this._cnt(); const l = this._line(); const end = Math.min(this.cur.col + n, l.length); this.register = l.slice(this.cur.col, end); this.registerIsLine = false; this.lines[this.cur.line] = l.slice(0, this.cur.col) + l.slice(end); } this.mode = "insert"; break;
         case "S": this._pushUndo(); { const indent = this._line().match(/^(\s*)/)[1]; this.lines[this.cur.line] = indent; this.cur.col = indent.length; } this.mode = "insert"; break;
 
         case "x": this._pushUndo(); this._deleteChars(this._cnt()); break;
         case "X": this._pushUndo(); this._deleteCharsBefore(this._cnt()); break;
         case "D": this._pushUndo(); this._deleteToEOL(); break;
         case "C": this._pushUndo(); this._deleteToEOL(); this.mode = "insert"; break;
-        case "J": this._pushUndo(); this._joinLine(); break;
+        case "J": this._pushUndo(); { const n = this._cnt(); for (let i = 0; i < n && this.cur.line < this.lines.length - 1; i++) this._joinLine(); } break;
 
+        case "Y": this._pushUndo(); this._yankLines(this._cnt()); break;
         case "p": this._pushUndo(); this._paste(false); break;
         case "P": this._pushUndo(); this._paste(true); break;
 
@@ -294,8 +396,12 @@ class VimEngine {
         case "v": this.mode = "visual"; this.visualStart = { ...this.cur }; break;
         case "V": this.mode = "visual-line"; this.visualStart = { ...this.cur }; break;
 
-        case "~": this._pushUndo(); this._toggleCase(); break;
+        case "~": this._pushUndo(); { const n = this._cnt(); for (let i = 0; i < n; i++) this._toggleCase(); } break;
         case ".": this._repeatLast(); break;
+        case "/": this._startSearch(1); break;
+        case "?": this._startSearch(-1); break;
+        case "n": { const m = this._searchMotion(1); if (m) this._applyMotion(m); } break;
+        case "N": { const m = this._searchMotion(-1); if (m) this._applyMotion(m); } break;
 
         case "r": return; // wait for next key (handled in multi-key section below)
 
@@ -321,23 +427,6 @@ class VimEngine {
       return;
     }
 
-    // Ctrl combos
-    if (key === "Ctrl-r") { this._redo(); this._resetPending(); return; }
-    if (key === "Ctrl-d") {
-      const half = Math.max(1, Math.floor(15 / 2));
-      this.cur.line = Math.min(this.cur.line + half, this.lines.length - 1);
-      this._clampCursor();
-      this._resetPending();
-      return;
-    }
-    if (key === "Ctrl-u") {
-      const half = Math.max(1, Math.floor(15 / 2));
-      this.cur.line = Math.max(this.cur.line - half, 0);
-      this._clampCursor();
-      this._resetPending();
-      return;
-    }
-
     // Didn't match anything
     if (pending.length > 3) this._resetPending();
   }
@@ -353,6 +442,19 @@ class VimEngine {
   _tryMotion(keys) {
     const k = keys[keys.length - 1];
     const seq = keys.join("");
+
+    // f/F/t/T + char must be checked BEFORE single-key switch (e.g. 'fb' should find 'b', not go backward)
+    if (keys.length >= 2) {
+      const cmd = keys[keys.length - 2];
+      if ("fFtT".includes(cmd) && keys.length === 2) {
+        return this._findChar(cmd, k);
+      }
+    }
+    if (keys.length === 1 && "fFtT".includes(k)) return "partial";
+
+    // gg (must also be before switch since 'g' alone is partial)
+    if (keys.length === 1 && k === "g") return "partial";
+    if (seq.endsWith("gg")) return { line: 0, col: 0 };
 
     switch (k) {
       case "h": return { line: this.cur.line, col: Math.max(0, this.cur.col - 1) };
@@ -375,22 +477,15 @@ class VimEngine {
       case "{": return this._paraMotion(-1);
       case "}": return this._paraMotion(1);
       case "%": return this._matchBracket();
-    }
-
-    // f/F/t/T + char
-    if (keys.length >= 2) {
-      const cmd = keys[keys.length - 2];
-      if ("fFtT".includes(cmd)) {
-        if (keys.length === (this.operator ? 2 : 2)) {
-          return this._findChar(cmd, k);
-        }
+      case "n": return this._searchMotion(1);
+      case "N": return this._searchMotion(-1);
+      case ";": return this.lastFind ? this._findChar(this.lastFind.cmd, this.lastFind.ch, false) : null;
+      case ",": {
+        if (!this.lastFind) return null;
+        const rev = { f: "F", F: "f", t: "T", T: "t" };
+        return this._findChar(rev[this.lastFind.cmd], this.lastFind.ch, false);
       }
     }
-    if (keys.length === 1 && "fFtT".includes(k)) return "partial";
-
-    // gg
-    if (keys.length === 1 && k === "g") return "partial";
-    if (seq.endsWith("gg")) return { line: 0, col: 0 };
 
     return null;
   }
@@ -406,13 +501,66 @@ class VimEngine {
     return idx >= 0 ? idx : 0;
   }
 
+  // Character class: 0=whitespace, 1=word (alnum/_), 2=punctuation
+  _charClass(ch) {
+    if (!ch || /\s/.test(ch)) return 0;
+    if (/\w/.test(ch)) return 1;
+    return 2;
+  }
+
   _wordMotion(dir) {
     let { line, col } = this.cur;
     const lines = this.lines;
     if (dir > 0) {
-      const l = lines[line];
-      // skip current word chars
-      while (col < l.length && !/\s/.test(l[col])) col++;
+      const startLine = line;
+      const cls = this._charClass(lines[line][col]);
+      if (cls > 0) {
+        // skip chars of same class
+        while (col < lines[line].length && this._charClass(lines[line][col]) === cls) col++;
+      }
+      // skip whitespace (including newlines)
+      let hitEnd = false;
+      while (true) {
+        while (col < lines[line].length && this._charClass(lines[line][col]) === 0) col++;
+        if (col < lines[line].length) break;
+        if (line >= lines.length - 1) { col = Math.max(0, lines[line].length - 1); hitEnd = true; break; }
+        line++; col = 0;
+      }
+      // If w couldn't advance past the line (end of file), make it inclusive
+      // so dw deletes through end of line like d$
+      if (hitEnd && line === startLine) {
+        return { line, col };
+      }
+    } else {
+      // Move back one position (cross to previous line if at col 0)
+      if (col > 0) {
+        col--;
+      } else if (line > 0) {
+        line--;
+        col = Math.max(0, lines[line].length - 1);
+      } else {
+        return { line, col, exclusive: true }; // already at start of file
+      }
+      // skip whitespace backwards (including newlines)
+      while (true) {
+        while (col > 0 && this._charClass(lines[line][col]) === 0) col--;
+        if (this._charClass(lines[line][col] || "") !== 0) break;
+        if (line <= 0) { col = 0; break; }
+        line--; col = Math.max(0, lines[line].length - 1);
+      }
+      // skip back to start of same-class word
+      const cls = this._charClass(lines[line][col]);
+      while (col > 0 && this._charClass(lines[line][col - 1]) === cls) col--;
+    }
+    return { line, col, exclusive: true };
+  }
+
+  _WORDMotion(dir) {
+    let { line, col } = this.cur;
+    const lines = this.lines;
+    if (dir > 0) {
+      // skip non-whitespace
+      while (col < lines[line].length && !/\s/.test(lines[line][col])) col++;
       // skip whitespace (including newlines)
       while (true) {
         while (col < lines[line].length && /\s/.test(lines[line][col])) col++;
@@ -421,39 +569,60 @@ class VimEngine {
         line++; col = 0;
       }
     } else {
-      if (col > 0) col--;
+      // Move back one position (cross to previous line if at col 0)
+      if (col > 0) {
+        col--;
+      } else if (line > 0) {
+        line--;
+        col = Math.max(0, lines[line].length - 1);
+      } else {
+        return { line, col, exclusive: true };
+      }
       // skip whitespace backwards
       while (true) {
         while (col > 0 && /\s/.test(lines[line][col])) col--;
-        if (col > 0 || (col === 0 && !/\s/.test(lines[line][col] || ""))) break;
+        if (!/\s/.test(lines[line][col] || "")) break;
         if (line <= 0) { col = 0; break; }
         line--; col = Math.max(0, lines[line].length - 1);
       }
-      // skip back to start of word
+      // skip back to start of WORD
       while (col > 0 && !/\s/.test(lines[line][col - 1])) col--;
     }
     return { line, col, exclusive: true };
   }
 
-  _WORDMotion(dir) { return this._wordMotion(dir); }
-
-  _endWordMotion(dir) {
+  _endWordMotion() {
     let { line, col } = this.cur;
     const lines = this.lines;
     col++;
-    // skip whitespace
+    // skip whitespace (including newlines)
+    while (true) {
+      while (col < lines[line].length && this._charClass(lines[line][col]) === 0) col++;
+      if (col < lines[line].length) break;
+      if (line >= lines.length - 1) { col = Math.max(0, lines[line].length - 1); break; }
+      line++; col = 0;
+    }
+    // move to end of same-class word
+    const cls = this._charClass(lines[line][col]);
+    while (col < lines[line].length - 1 && this._charClass(lines[line][col + 1]) === cls) col++;
+    return { line, col };
+  }
+
+  _endWORDMotion() {
+    let { line, col } = this.cur;
+    const lines = this.lines;
+    col++;
+    // skip whitespace (including newlines)
     while (true) {
       while (col < lines[line].length && /\s/.test(lines[line][col])) col++;
       if (col < lines[line].length) break;
       if (line >= lines.length - 1) { col = Math.max(0, lines[line].length - 1); break; }
       line++; col = 0;
     }
-    // move to end of word
+    // move to end of WORD (non-whitespace)
     while (col < lines[line].length - 1 && !/\s/.test(lines[line][col + 1])) col++;
     return { line, col };
   }
-
-  _endWORDMotion(dir) { return this._endWordMotion(dir); }
 
   _paraMotion(dir) {
     let line = this.cur.line;
@@ -469,7 +638,8 @@ class VimEngine {
     return { line, col: 0, exclusive: true };
   }
 
-  _findChar(cmd, ch) {
+  _findChar(cmd, ch, saveFind = true) {
+    if (saveFind) this.lastFind = { cmd, ch };
     const line = this._line();
     const forward = cmd === "f" || cmd === "t";
     const on = cmd === "f" || cmd === "F";
@@ -540,12 +710,19 @@ class VimEngine {
   _wordObject(inner) {
     const line = this._line();
     let start = this.cur.col, end = this.cur.col;
-    // expand to word boundaries
-    while (start > 0 && !/\s/.test(line[start - 1])) start--;
-    while (end < line.length - 1 && !/\s/.test(line[end + 1])) end++;
-    if (!inner) {
-      // include trailing space
-      while (end < line.length - 1 && /\s/.test(line[end + 1])) end++;
+    const cls = this._charClass(line[start]);
+    if (cls === 0) {
+      // On whitespace: select the whitespace run
+      while (start > 0 && this._charClass(line[start - 1]) === 0) start--;
+      while (end < line.length - 1 && this._charClass(line[end + 1]) === 0) end++;
+    } else {
+      // Expand to same-class word boundaries
+      while (start > 0 && this._charClass(line[start - 1]) === cls) start--;
+      while (end < line.length - 1 && this._charClass(line[end + 1]) === cls) end++;
+      if (!inner) {
+        // include trailing space
+        while (end < line.length - 1 && this._charClass(line[end + 1]) === 0) end++;
+      }
     }
     return { startLine: this.cur.line, startCol: start, endLine: this.cur.line, endCol: end };
   }
@@ -685,12 +862,16 @@ class VimEngine {
     let sL = this.cur.line, sC = this.cur.col;
     let eL = dest.line, eC = dest.col;
     // Exclusive motions: the destination char is NOT included (w, W, {, }, gg, G, etc.)
-    // Back up end position by one character so the range is correct
     const isExclusive = dest.exclusive;
     if (isExclusive) {
-      if (eC > 0) {
+      // If exclusive motion didn't actually move past current position,
+      // treat it as inclusive (vim behavior for dw at end of line)
+      if (eL === sL && eC <= sC) {
+        // Didn't move or moved backward — extend to end of line instead
+        eC = Math.max(0, this.lines[eL].length - 1);
+      } else if (eC > 0) {
         eC--;
-      } else if (eL > 0) {
+      } else if (eL > sL) {
         eL--;
         eC = Math.max(0, this.lines[eL].length - 1);
       }
@@ -698,7 +879,6 @@ class VimEngine {
     if (sL > eL || (sL === eL && sC > eC)) {
       [sL, sC, eL, eC] = [eL, eC, sL, sC];
     }
-    // If backing up made end < start (e.g. dw at end of word on same pos), just delete the char
     if (sL > eL || (sL === eL && sC > eC)) return;
     this._execOperatorRange(op, { startLine: sL, startCol: sC, endLine: eL, endCol: eC });
   }
@@ -775,8 +955,12 @@ class VimEngine {
 
   _changeLines(n) {
     const indent = this._line().match(/^(\s*)/)[1];
+    const insertAt = this.cur.line;
     this._deleteLines(n);
-    this.lines.splice(this.cur.line, 0, indent);
+    // Insert at original position (splice handles out-of-bounds by appending)
+    const insertIdx = Math.min(insertAt, this.lines.length);
+    this.lines.splice(insertIdx, 0, indent);
+    this.cur.line = insertIdx;
     this.cur.col = indent.length;
     this.mode = "insert";
   }
@@ -889,8 +1073,106 @@ class VimEngine {
   }
 
   _repeatLast() {
-    // Simplified: just replay last undo
-    // A full implementation would record and replay keystrokes
+    if (!this.lastChange || this.lastChange.length === 0) return;
+    this._pushUndo();
+    // Save and clear state so replay starts fresh
+    const savedRecording = this._isRecordingChange;
+    this._isRecordingChange = null;
+    this.pendingKeys = [];
+    this.operator = null;
+    this.count = null;
+    for (const k of this.lastChange) {
+      this.processKey(k);
+    }
+    // Restore (replay should have left us in normal mode with clean state)
+    this._isRecordingChange = savedRecording;
+    this.pendingKeys = [];
+    this.operator = null;
+    this.count = null;
+  }
+
+  // ── Search ──
+  _startSearch(dir) {
+    this.searchActive = true;
+    this.searchDirection = dir;
+    this.searchBuffer = "";
+    this.statusMsg = dir > 0 ? "/" : "?";
+  }
+
+  _searchInput(key) {
+    if (key === "Escape") {
+      this.searchActive = false;
+      this.searchBuffer = "";
+      this.statusMsg = "";
+      return;
+    }
+    if (key === "Enter") {
+      this.searchActive = false;
+      if (this.searchBuffer.length > 0) {
+        this.searchPattern = this.searchBuffer;
+      }
+      this.searchBuffer = "";
+      // Jump to first match
+      if (this.searchPattern) {
+        const m = this._searchMotion(1);
+        if (m) {
+          this._applyMotion(m);
+          this.statusMsg = "/" + this.searchPattern;
+        } else {
+          this.statusMsg = "Pattern not found: " + this.searchPattern;
+        }
+      }
+      this._clampCursor();
+      return;
+    }
+    if (key === "Backspace") {
+      this.searchBuffer = this.searchBuffer.slice(0, -1);
+      this.statusMsg = (this.searchDirection > 0 ? "/" : "?") + this.searchBuffer;
+      return;
+    }
+    if (key.length === 1) {
+      this.searchBuffer += key;
+      this.statusMsg = (this.searchDirection > 0 ? "/" : "?") + this.searchBuffer;
+    }
+  }
+
+  // Returns a motion {line, col} for the next/prev search match, or null
+  _searchMotion(relDir) {
+    if (!this.searchPattern) return null;
+    const dir = this.searchDirection * relDir; // relDir: 1=same dir, -1=opposite
+    const text = this.getText();
+    let pat;
+    try { pat = new RegExp(this.searchPattern, "g"); } catch { return null; }
+    // Collect all match positions
+    const matches = [];
+    let m;
+    while ((m = pat.exec(text)) !== null) {
+      const pos = this._offsetToPos(m.index);
+      matches.push(pos);
+      if (m[0].length === 0) pat.lastIndex++; // avoid infinite loop on zero-width
+    }
+    if (matches.length === 0) {
+      this.statusMsg = "Pattern not found: " + this.searchPattern;
+      return null;
+    }
+    const curOff = this._posToOffset(this.cur.line, this.cur.col);
+    if (dir > 0) {
+      // Find first match AFTER cursor
+      for (const p of matches) {
+        const off = this._posToOffset(p.line, p.col);
+        if (off > curOff) return { ...p, exclusive: true };
+      }
+      // Wrap around
+      return { ...matches[0], exclusive: true };
+    } else {
+      // Find last match BEFORE cursor
+      for (let i = matches.length - 1; i >= 0; i--) {
+        const off = this._posToOffset(matches[i].line, matches[i].col);
+        if (off < curOff) return { ...matches[i], exclusive: true };
+      }
+      // Wrap around
+      return { ...matches[matches.length - 1], exclusive: true };
+    }
   }
 
   // ── Visual mode helpers ──
@@ -898,12 +1180,11 @@ class VimEngine {
     if (!this.visualStart) return null;
     let sL = this.visualStart.line, sC = this.visualStart.col;
     let eL = this.cur.line, eC = this.cur.col;
+    if (sL > eL || (sL === eL && sC > eC)) [sL, sC, eL, eC] = [eL, eC, sL, sC];
     if (this.mode === "visual-line") {
       sC = 0;
-      eC = this.lines[eL].length - 1;
+      eC = Math.max(0, this.lines[eL].length - 1);
     }
-    if (sL > eL || (sL === eL && sC > eC)) [sL, sC, eL, eC] = [eL, eC, sL, sC];
-    if (this.mode === "visual-line") { sC = 0; eC = this.lines[eL].length; }
     return { startLine: sL, startCol: sC, endLine: eL, endCol: eC };
   }
 
@@ -1915,6 +2196,363 @@ function processQueue(queue) {
 }`,
     hint: "Go to the blank line after the create method. Use o to open a line below and type the new method. Or yank the create method, paste, and modify.",
   },
+
+  // ── Repeat & Dot ──
+  {
+    topic: "repeat-dot",
+    title: "Delete every TODO comment",
+    description: "Use dd then . to quickly remove all the TODO lines.",
+    start: `function bootstrap(app) {
+  // TODO: add rate limiting
+  app.use(cors());
+  // TODO: add request logging
+  app.use(helmet());
+  // TODO: add CSRF protection
+  app.use(compression());
+  // TODO: add health check endpoint
+  registerRoutes(app);
+}`,
+    target: `function bootstrap(app) {
+  app.use(cors());
+  app.use(helmet());
+  app.use(compression());
+  registerRoutes(app);
+}`,
+    hint: "Move to the first TODO line, dd to delete it. Move to the next TODO line with j, then . to repeat the dd.",
+  },
+  {
+    topic: "repeat-dot",
+    title: "Add semicolons to every line",
+    description: "Each statement is missing its semicolon. Add them efficiently with . repeat.",
+    start: `const name = "Alice"
+const age = 30
+const email = "alice@test.com"
+const active = true
+const role = "admin"
+const lastLogin = new Date()`,
+    target: `const name = "Alice";
+const age = 30;
+const email = "alice@test.com";
+const active = true;
+const role = "admin";
+const lastLogin = new Date();`,
+    hint: "On the first line, press A to go to end and enter insert mode, type ';', press Escape. Then j. to go down and repeat.",
+  },
+  {
+    topic: "repeat-dot",
+    title: "Change var to const everywhere",
+    description: "Modernize this code by changing all 'var' declarations to 'const'.",
+    start: `var express = require('express');
+var bodyParser = require('body-parser');
+var morgan = require('morgan');
+var helmet = require('helmet');
+var cors = require('cors');
+
+var app = express();
+var port = process.env.PORT || 3000;`,
+    target: `const express = require('express');
+const bodyParser = require('body-parser');
+const morgan = require('morgan');
+const helmet = require('helmet');
+const cors = require('cors');
+
+const app = express();
+const port = process.env.PORT || 3000;`,
+    hint: "On the first line, use cw to change 'var' to 'const'. Then j0 to go to next line start, and . to repeat. Skip the blank line with j.",
+  },
+  {
+    topic: "repeat-dot",
+    title: "Unwrap all the await calls",
+    description: "Remove 'await ' from every line that has it. Keep the rest of each line.",
+    start: `async function cleanup() {
+  await cache.flush();
+  await db.disconnect();
+  await queue.drain();
+  await logger.close();
+  await metrics.flush();
+}`,
+    target: `async function cleanup() {
+  cache.flush();
+  db.disconnect();
+  queue.drain();
+  logger.close();
+  metrics.flush();
+}`,
+    hint: "Go to the first await line. Use f then a to find 'a', then dw to delete 'await '. Move to next line, use . to repeat.",
+  },
+
+  // ── Find & Navigate ──
+  {
+    topic: "find-navigate",
+    title: "Fix all the separators with ;",
+    description: "Change every | separator to , using f and ; to jump between them.",
+    start: `const fields = "name|email|age|role|status";`,
+    target: `const fields = "name,email,age,role,status";`,
+    hint: "Use f| to jump to the first pipe, then r, to replace it with comma. Use ; to jump to the next pipe, then . to repeat the replacement.",
+  },
+  {
+    topic: "find-navigate",
+    title: "Navigate with t and change values",
+    description: "Change each value after the = sign. Use t= to jump just before each =.",
+    start: `HOST=localhost
+PORT=3000
+DB_NAME=testdb
+DB_USER=root
+DB_PASS=password123`,
+    target: `HOST=production.server.com
+PORT=8080
+DB_NAME=myapp_prod
+DB_USER=deploy
+DB_PASS=s3cur3_p@ss`,
+    hint: "On each line, use f= then l to land after =, then C to change to end of line and type the new value.",
+  },
+  {
+    topic: "find-navigate",
+    title: "Delete all type annotations",
+    description: "Remove the TypeScript type annotations (: string, : number, etc.) from the parameters.",
+    start: `function createUser(
+  name: string,
+  email: string,
+  age: number,
+  role: string,
+  active: boolean
+) {
+  return { name, email, age, role, active };
+}`,
+    target: `function createUser(
+  name,
+  email,
+  age,
+  role,
+  active
+) {
+  return { name, email, age, role, active };
+}`,
+    hint: "On each parameter line, use f: to find the colon, then d$ or dt, to delete the type. Use j then . to repeat.",
+  },
+
+  // ── Counts ──
+  {
+    topic: "counts",
+    title: "Delete multiple lines with count",
+    description: "Delete the 4 deprecated methods in one command using a count.",
+    start: `class EventEmitter {
+  on(event, fn) { /* ... */ }
+  off(event, fn) { /* ... */ }
+  emit(event, data) { /* ... */ }
+  once(event, fn) { /* ... */ }
+  addListener(event, fn) { /* deprecated */ }
+  removeListener(event, fn) { /* deprecated */ }
+  removeAllListeners(event) { /* deprecated */ }
+  listeners(event) { /* deprecated */ }
+  listenerCount(event) { return this.listeners(event).length; }
+}`,
+    target: `class EventEmitter {
+  on(event, fn) { /* ... */ }
+  off(event, fn) { /* ... */ }
+  emit(event, data) { /* ... */ }
+  once(event, fn) { /* ... */ }
+  listenerCount(event) { return this.listeners(event).length; }
+}`,
+    hint: "Navigate to the first deprecated line (addListener). Use 4dd to delete 4 lines at once.",
+  },
+  {
+    topic: "counts",
+    title: "Move down and delete with counts",
+    description: "Delete the 3 words 'very ' from the sentence using d3w style commands.",
+    start: `const message = "This is a very very very important message";`,
+    target: `const message = "This is a important message";`,
+    hint: "Navigate to the first 'very' with f then v. Use d3w to delete 'very very very ' in one go, or dw then . . to repeat.",
+  },
+  {
+    topic: "counts",
+    title: "Join multiple lines into one",
+    description: "The array items are on separate lines. Join them into a single line using J with a count.",
+    start: `const colors = [
+  "red",
+  "green",
+  "blue",
+  "yellow"
+];`,
+    target: `const colors = [ "red", "green", "blue", "yellow" ];`,
+    hint: "Place cursor on the first line. Use 5J to join all 6 lines into one.",
+  },
+  {
+    topic: "counts",
+    title: "Indent a block deeper",
+    description: "The if block body needs two more levels of indentation (4 spaces total).",
+    start: `function handle(req) {
+  if (req.method === 'POST') {
+  const body = req.body;
+  validate(body);
+  process(body);
+  return { ok: true };
+  }
+}`,
+    target: `function handle(req) {
+  if (req.method === 'POST') {
+    const body = req.body;
+    validate(body);
+    process(body);
+    return { ok: true };
+  }
+}`,
+    hint: "Go to line 3 (const body). Use V then 3j to select the 4 lines, then > to indent them.",
+  },
+
+  // ── WORD Motions ──
+  {
+    topic: "movement",
+    title: "Navigate URLs and paths with W",
+    description: "Change the base URL from the staging to production URL.",
+    start: `const config = {
+  api: "https://staging.api.example.com/v2/graphql",
+  cdn: "https://cdn.staging.example.com/assets",
+  ws: "wss://staging.ws.example.com/socket",
+};`,
+    target: `const config = {
+  api: "https://prod.api.example.com/v2/graphql",
+  cdn: "https://cdn.prod.example.com/assets",
+  ws: "wss://prod.ws.example.com/socket",
+};`,
+    hint: "On each line, use ci\" to change inside quotes and type the new URL. Or use f then s to find 'staging' and cw to change just that word.",
+  },
+
+  // ── More Text Objects ──
+  {
+    topic: "text-objects",
+    title: "Change the callback function body",
+    description: "Replace everything inside the curly braces of the callback with a single return statement.",
+    start: `app.get('/health', (req, res) => {
+  const uptime = process.uptime();
+  const memory = process.memoryUsage();
+  const status = db.isConnected() ? 'healthy' : 'degraded';
+  const version = require('./package.json').version;
+  res.json({ status, uptime, memory, version });
+});`,
+    target: `app.get('/health', (req, res) => {
+  res.json({ status: 'ok' });
+});`,
+    hint: "Put cursor inside the curly braces. Use ci{ to change inside braces. Type the new body with proper indentation.",
+  },
+  {
+    topic: "text-objects",
+    title: "Swap the quoted strings",
+    description: "Change the error messages: swap 'not found' to 'missing' and 'invalid' to 'malformed'.",
+    start: `function validate(input) {
+  if (!input.id) throw new Error("not found");
+  if (!input.name) throw new Error("invalid");
+  if (!input.email) throw new Error("not found");
+  if (!input.role) throw new Error("invalid");
+  return true;
+}`,
+    target: `function validate(input) {
+  if (!input.id) throw new Error("missing");
+  if (!input.name) throw new Error("malformed");
+  if (!input.email) throw new Error("missing");
+  if (!input.role) throw new Error("malformed");
+  return true;
+}`,
+    hint: "On each line, use f\" to jump to the quote, then ci\" to change inside quotes. Type the new string. Use j then f\" then . where the same replacement applies.",
+  },
+
+  // ── More Visual Mode ──
+  {
+    topic: "visual-mode",
+    title: "Sort imports by selecting and moving",
+    description: "Reorder the imports so they are grouped: React first, then libraries, then local.",
+    start: `import { formatDate } from './utils';
+import React, { useState } from 'react';
+import axios from 'axios';
+import { Header } from './components';
+import { z } from 'zod';`,
+    target: `import React, { useState } from 'react';
+import axios from 'axios';
+import { z } from 'zod';
+import { formatDate } from './utils';
+import { Header } from './components';`,
+    hint: "Use dd to cut a line, then move to the target position and p or P to paste. Repeat for each line that needs to move.",
+  },
+  {
+    topic: "visual-mode",
+    title: "Wrap lines in an array",
+    description: "The list of routes should be wrapped in an array. Add [ before the first and ] after the last, then indent.",
+    start: `const routes =
+  '/home',
+  '/about',
+  '/contact',
+  '/blog',
+  '/login',
+;`,
+    target: `const routes = [
+  '/home',
+  '/about',
+  '/contact',
+  '/blog',
+  '/login',
+];`,
+    hint: "Go to end of first line, use A to append and type ' ['. Go to the last line, use A then backspace the ; and type '];'. Or use r on the ;.",
+  },
+
+  // ── More Real World ──
+  {
+    topic: "real-world",
+    title: "Convert object to destructured params",
+    description: "Change the function to use destructured parameters instead of accessing config properties.",
+    start: `function connect(config) {
+  const host = config.host;
+  const port = config.port;
+  const user = config.user;
+  const pass = config.pass;
+  return createPool(host, port, user, pass);
+}`,
+    target: `function connect({ host, port, user, pass }) {
+  return createPool(host, port, user, pass);
+}`,
+    hint: "Change 'config' to '{ host, port, user, pass }' using ci( on the first line. Then delete the 4 const lines with 4dd.",
+  },
+  {
+    topic: "real-world",
+    title: "Add default values",
+    description: "Add default values to each parameter using || operator.",
+    start: `function createConfig(host, port, retries, timeout) {
+  return {
+    host: host,
+    port: port,
+    retries: retries,
+    timeout: timeout,
+  };
+}`,
+    target: `function createConfig(host, port, retries, timeout) {
+  return {
+    host: host || 'localhost',
+    port: port || 3000,
+    retries: retries || 3,
+    timeout: timeout || 5000,
+  };
+}`,
+    hint: "On each property line, use A to go to end, backspace the comma, type the || default, add comma back. Or use f, then i to insert before comma.",
+  },
+  {
+    topic: "real-world",
+    title: "Convert callbacks to async/await",
+    description: "Refactor the nested callbacks into a flat async/await style.",
+    start: `function loadUser(id, callback) {
+  db.find(id, (err, user) => {
+    if (err) return callback(err);
+    db.getProfile(user.profileId, (err, profile) => {
+      if (err) return callback(err);
+      callback(null, { ...user, profile });
+    });
+  });
+}`,
+    target: `async function loadUser(id) {
+  const user = await db.find(id);
+  const profile = await db.getProfile(user.profileId);
+  return { ...user, profile };
+}`,
+    hint: "This is a full rewrite. Use cc on the first line to change the signature. Then delete the callback body and type the new async version using o for new lines.",
+  },
 ];
 
 
@@ -2035,15 +2673,23 @@ function render() {
 
   // Mode indicator
   const modeEl = $("#mode-indicator");
-  const modeLabel = vim.operator
-    ? `OPERATOR (${vim.operator})`
-    : vim.mode === "visual-line" ? "V-LINE" : vim.mode.toUpperCase();
-  modeEl.textContent = "-- " + modeLabel + " --";
-  modeEl.className = "mode " + (vim.operator ? "operator" : vim.mode === "visual-line" ? "visual" : vim.mode);
+  if (vim.searchActive) {
+    modeEl.textContent = vim.statusMsg || "/";
+    modeEl.className = "mode search";
+  } else if (vim.statusMsg && vim.statusMsg.startsWith("Pattern not found")) {
+    modeEl.textContent = vim.statusMsg;
+    modeEl.className = "mode search-error";
+  } else {
+    const modeLabel = vim.operator
+      ? `OPERATOR (${vim.operator})`
+      : vim.mode === "visual-line" ? "V-LINE" : vim.mode.toUpperCase();
+    modeEl.textContent = "-- " + modeLabel + " --";
+    modeEl.className = "mode " + (vim.operator ? "operator" : vim.mode === "visual-line" ? "visual" : vim.mode);
+  }
 
   // Keys display
   const pending = [...(vim.count !== null ? [vim.count] : []), ...(vim.operator ? [vim.operator] : []), ...vim.pendingKeys];
-  $("#keys-display").textContent = pending.join("");
+  $("#keys-display").textContent = vim.searchActive ? "" : pending.join("");
 
   // Cursor info
   $("#cursor-info").textContent = `${vim.cur.line + 1}:${vim.cur.col + 1}`;

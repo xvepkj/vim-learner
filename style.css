@@ -226,6 +226,8 @@ body {
 .mode.insert { color: white; background: var(--green); }
 .mode.visual { color: white; background: var(--purple); }
 .mode.operator { color: white; background: var(--amber); }
+.mode.search { color: var(--accent); font-family: 'JetBrains Mono', monospace; }
+.mode.search-error { color: #ff6b6b; }
 
 .keys { color: var(--dim); min-width: 4rem; }
 .pos { margin-left: auto; }
